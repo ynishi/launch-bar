@@ -1,0 +1,21 @@
+[package]
+name = "launch-bar"
+version = "0.1.0"
+edition = "2021"
+description = "Context-aware command launcher with icon buttons"
+license = "MIT"
+repository = "https://github.com/ynishi/launch-bar"
+keywords = ["cli", "launcher", "egui", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "../../README.md"
+
+[dependencies]
+egui-cha = "0.4.0"
+egui-cha-ds = "0.4.0"
+eframe = "0.33"
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+dirs = "6.0"
+shellexpand = "3.1"
+arboard = "3.4"
+notify = "8.0"
