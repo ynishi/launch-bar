@@ -13,15 +13,17 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::Instant;
 
 use arboard::Clipboard;
 use eframe::egui;
-use egui_cha_ds::Theme;
 use egui_cha_ds::icons;
+use egui_cha_ds::Theme;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use rhai::{Engine, Scope};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -54,7 +56,10 @@ struct Preset {
 #[derive(Debug, Deserialize, Clone)]
 struct CommandConfig {
     name: String,
-    cmd: String,
+    #[serde(default)]
+    cmd: Option<String>,
+    #[serde(default)]
+    run: Option<String>,
     #[serde(default)]
     icon: Option<String>,
     #[serde(default)]
@@ -158,7 +163,7 @@ impl AppState {
 // Preset Detection
 // ============================================================================
 
-fn detect_preset<'a>(working_dir: &PathBuf, presets: &'a [Preset]) -> Option<&'a Preset> {
+fn detect_preset<'a>(working_dir: &std::path::Path, presets: &'a [Preset]) -> Option<&'a Preset> {
     for preset in presets {
         // Check detect_file
         if let Some(ref file) = preset.detect_file {
@@ -304,6 +309,131 @@ fn open_file(path: &PathBuf) {
 }
 
 // ============================================================================
+// Rhai Scripting
+// ============================================================================
+
+fn create_rhai_engine(cwd: Arc<PathBuf>) -> Engine {
+    let mut engine = Engine::new();
+
+    // clipboard() -> String (returns "[ERROR:clipboard]" on failure for visibility)
+    engine.register_fn("clipboard", || -> String {
+        Clipboard::new()
+            .and_then(|mut cb| cb.get_text())
+            .unwrap_or_else(|_| "[ERROR:clipboard]".to_string())
+    });
+
+    // clipboard_set(text) -> bool
+    engine.register_fn("clipboard_set", |text: String| -> bool {
+        Clipboard::new()
+            .and_then(|mut cb| cb.set_text(text))
+            .is_ok()
+    });
+
+    // shell(cmd) -> String
+    let cwd_for_shell = Arc::clone(&cwd);
+    engine.register_fn("shell", move |cmd: String| -> String {
+        let output = Command::new("sh")
+            .args(["-c", &cmd])
+            .current_dir(cwd_for_shell.as_ref())
+            .output();
+        match output {
+            Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
+            Err(e) => format!("[ERROR:shell] {}", e),
+        }
+    });
+
+    // shell_spawn(cmd) -> bool
+    let cwd_for_spawn = Arc::clone(&cwd);
+    engine.register_fn("shell_spawn", move |cmd: String| -> bool {
+        Command::new("sh")
+            .args(["-c", &cmd])
+            .current_dir(cwd_for_spawn.as_ref())
+            .spawn()
+            .is_ok()
+    });
+
+    // claude(prompt) -> String
+    let cwd_for_claude = Arc::clone(&cwd);
+    engine.register_fn("claude", move |prompt: String| -> String {
+        let output = Command::new("claude")
+            .args(["-p", &prompt])
+            .current_dir(cwd_for_claude.as_ref())
+            .output();
+        match output {
+            Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
+            Err(e) => format!("[ERROR:claude] {}", e),
+        }
+    });
+
+    // notify(message) - display alert dialog
+    #[cfg(target_os = "macos")]
+    engine.register_fn("notify", |msg: String| {
+        let escaped = msg
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", " ")
+            .replace("\r", "");
+        let script = format!(r#"display alert "Launch Bar" message "{}""#, escaped);
+        let _ = Command::new("osascript").args(["-e", &script]).spawn();
+    });
+
+    #[cfg(not(target_os = "macos"))]
+    engine.register_fn("notify", |msg: String| {
+        eprintln!("[notify] {}", msg);
+    });
+
+    // open(path) - open file/URL with default app
+    engine.register_fn("open", |path: String| {
+        #[cfg(target_os = "macos")]
+        let _ = Command::new("open").arg(&path).spawn();
+        #[cfg(target_os = "linux")]
+        let _ = Command::new("xdg-open").arg(&path).spawn();
+        #[cfg(target_os = "windows")]
+        let _ = Command::new("cmd").args(["/C", "start", &path]).spawn();
+    });
+
+    // env(name) -> String
+    engine.register_fn("env", |name: String| -> String {
+        std::env::var(&name).unwrap_or_default()
+    });
+
+    // read_file(path) -> String (returns "[ERROR:read_file] ..." on failure)
+    let cwd_for_read = Arc::clone(&cwd);
+    engine.register_fn("read_file", move |path: String| -> String {
+        let full_path = if path.starts_with('/') {
+            PathBuf::from(&path)
+        } else {
+            cwd_for_read.join(&path)
+        };
+        std::fs::read_to_string(&full_path)
+            .unwrap_or_else(|e| format!("[ERROR:read_file] {}: {}", path, e))
+    });
+
+    // write_file(path, content) -> bool
+    engine.register_fn("write_file", move |path: String, content: String| -> bool {
+        let full_path = if path.starts_with('/') {
+            PathBuf::from(path)
+        } else {
+            cwd.join(path)
+        };
+        std::fs::write(full_path, content).is_ok()
+    });
+
+    engine
+}
+
+/// Execute a Rhai script and return (success, message)
+fn run_rhai_script(script: &str, cwd: Arc<PathBuf>) -> (bool, String) {
+    let engine = create_rhai_engine(cwd);
+    let mut scope = Scope::new();
+
+    match engine.run_with_scope(&mut scope, script) {
+        Ok(_) => (true, "Script completed".to_string()),
+        Err(e) => (false, format!("Script error: {}", e)),
+    }
+}
+
+// ============================================================================
 // UI Helpers
 // ============================================================================
 
@@ -435,6 +565,13 @@ fn available_icons() -> Vec<&'static str> {
 // App
 // ============================================================================
 
+/// Result from async script execution
+struct ScriptResult {
+    index: usize,
+    success: bool,
+    message: String,
+}
+
 struct LaunchBarApp {
     commands: Vec<CommandConfig>,
     working_dir: PathBuf,
@@ -453,6 +590,9 @@ struct LaunchBarApp {
     // Process tracking
     running_processes: HashMap<usize, std::process::Child>,
     process_results: HashMap<usize, ProcessResult>,
+    running_scripts: std::collections::HashSet<usize>,
+    script_rx: Receiver<ScriptResult>,
+    script_tx: Sender<ScriptResult>,
     // File watcher for highlight
     file_changed: Arc<AtomicBool>,
     highlight_until: Option<Instant>,
@@ -510,6 +650,8 @@ impl LaunchBarApp {
             Some(w)
         });
 
+        let (script_tx, script_rx) = mpsc::channel();
+
         Self {
             commands,
             working_dir,
@@ -527,6 +669,9 @@ impl LaunchBarApp {
             config_path,
             running_processes: HashMap::new(),
             process_results: HashMap::new(),
+            running_scripts: std::collections::HashSet::new(),
+            script_rx,
+            script_tx,
             file_changed,
             highlight_until: None,
             watcher,
@@ -541,36 +686,85 @@ impl LaunchBarApp {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| self.working_dir.clone());
 
-            // Expand $clipboard variable
-            let cmd_str = if cmd_config.cmd.contains("$clipboard") {
-                match Clipboard::new().and_then(|mut cb| cb.get_text()) {
-                    Ok(text) => cmd_config.cmd.replace("$clipboard", &text),
-                    Err(_) => {
-                        self.last_status = Some("Failed to read clipboard".to_string());
+            // Rhai script execution (async)
+            if let Some(ref script) = cmd_config.run {
+                // Warn if both cmd and run are set
+                if cmd_config.cmd.is_some() {
+                    eprintln!(
+                        "[warn] Command '{}' has both 'cmd' and 'run' set; 'run' takes priority",
+                        cmd_config.name
+                    );
+                }
+
+                // Don't run if already running
+                if self.running_scripts.contains(&index) {
+                    return;
+                }
+
+                self.running_scripts.insert(index);
+                self.last_status = Some(format!("Running: {}", cmd_config.name));
+                self.is_error = false;
+
+                let script = script.clone();
+                let cwd = Arc::new(cwd);
+                let tx = self.script_tx.clone();
+
+                std::thread::spawn(move || {
+                    // Catch panics to ensure tx.send is always called
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_rhai_script(&script, cwd)
+                    }));
+
+                    let (success, message) = match result {
+                        Ok((s, m)) => (s, m),
+                        Err(_) => (false, "Script panicked".to_string()),
+                    };
+
+                    let _ = tx.send(ScriptResult {
+                        index,
+                        success,
+                        message,
+                    });
+                });
+                return;
+            }
+
+            // Shell command execution
+            if let Some(ref cmd) = cmd_config.cmd {
+                // Expand $clipboard variable
+                let cmd_str = if cmd.contains("$clipboard") {
+                    match Clipboard::new().and_then(|mut cb| cb.get_text()) {
+                        Ok(text) => cmd.replace("$clipboard", &text),
+                        Err(_) => {
+                            self.last_status = Some("Failed to read clipboard".to_string());
+                            self.is_error = true;
+                            return;
+                        }
+                    }
+                } else {
+                    cmd.clone()
+                };
+
+                let result = spawn_shell_command(&cmd_str, &cwd);
+
+                match result {
+                    Ok(child) => {
+                        // Clear all previous success results when a new command is run
+                        self.process_results
+                            .retain(|_, v| *v != ProcessResult::Success);
+                        self.running_processes.insert(index, child);
+                        self.last_status = Some(format!("Running: {}", cmd_config.name));
+                        self.is_error = false;
+                    }
+                    Err(e) => {
+                        self.last_status = Some(format!("Failed: {}", e));
                         self.is_error = true;
-                        return;
+                        self.process_results.insert(index, ProcessResult::Failed);
                     }
                 }
             } else {
-                cmd_config.cmd.clone()
-            };
-
-            let result = spawn_shell_command(&cmd_str, &cwd);
-
-            match result {
-                Ok(child) => {
-                    // Clear all previous success results when a new command is run
-                    self.process_results
-                        .retain(|_, v| *v != ProcessResult::Success);
-                    self.running_processes.insert(index, child);
-                    self.last_status = Some(format!("Running: {}", cmd_config.name));
-                    self.is_error = false;
-                }
-                Err(e) => {
-                    self.last_status = Some(format!("Failed: {}", e));
-                    self.is_error = true;
-                    self.process_results.insert(index, ProcessResult::Failed);
-                }
+                self.last_status = Some("No command or script defined".to_string());
+                self.is_error = true;
             }
         }
     }
@@ -603,6 +797,28 @@ impl LaunchBarApp {
                 };
                 self.last_status = Some(status_msg);
                 self.is_error = result == ProcessResult::Failed;
+            }
+        }
+    }
+
+    fn check_scripts(&mut self) {
+        while let Ok(result) = self.script_rx.try_recv() {
+            self.running_scripts.remove(&result.index);
+            let proc_result = if result.success {
+                ProcessResult::Success
+            } else {
+                ProcessResult::Failed
+            };
+            self.process_results.insert(result.index, proc_result);
+
+            if let Some(cmd) = self.commands.get(result.index) {
+                let status_msg = if result.success {
+                    format!("Done: {}", cmd.name)
+                } else {
+                    result.message
+                };
+                self.last_status = Some(status_msg);
+                self.is_error = !result.success;
             }
         }
     }
@@ -640,8 +856,9 @@ impl eframe::App for LaunchBarApp {
             (self.opacity * 255.0) as u8,
         );
 
-        // Check running processes
+        // Check running processes and scripts
         self.check_processes();
+        self.check_scripts();
 
         // Check file changes and update highlight state
         if self.file_changed.swap(false, Ordering::SeqCst) {
@@ -743,9 +960,11 @@ impl eframe::App for LaunchBarApp {
                     self.save_current_position(ctx);
                 }
 
-                // Custom title bar
-                if show_title_bar {
-                    ui.horizontal(|ui| {
+                // Custom title bar (always reserve space, only show icons when enabled)
+                ui.horizontal(|ui| {
+                    ui.set_min_height(20.0);
+
+                    if show_title_bar {
                         // Show preset name on the left
                         if let Some(ref name) = self.preset_name {
                             ui.label(
@@ -798,10 +1017,8 @@ impl eframe::App for LaunchBarApp {
                                 open_file(&self.config_path);
                             }
                         });
-                    });
-                } else {
-                    ui.add_space(theme.spacing_sm);
-                }
+                    }
+                });
 
                 // Command buttons
                 let mut clicked_index = None;
@@ -815,8 +1032,9 @@ impl eframe::App for LaunchBarApp {
                             .map(|s| get_icon(s))
                             .unwrap_or(icons::PLAY);
 
-                        // Determine icon color based on process state
-                        let is_running = self.running_processes.contains_key(&index);
+                        // Determine state based on process/script
+                        let is_running = self.running_processes.contains_key(&index)
+                            || self.running_scripts.contains(&index);
                         let process_result = self.process_results.get(&index);
 
                         let icon_color = if is_running {
@@ -841,19 +1059,23 @@ impl eframe::App for LaunchBarApp {
                             hovered_index = Some(index);
                         }
 
-                        // Draw underline for finished processes
-                        if let Some(result) = process_result {
-                            let underline_color = match result {
+                        // Draw underline for running or finished
+                        let underline_color = if is_running {
+                            Some(colors::RUNNING_ICON)
+                        } else {
+                            process_result.map(|r| match r {
                                 ProcessResult::Success => colors::SUCCESS_UNDERLINE,
                                 ProcessResult::Failed => colors::ERROR_UNDERLINE,
-                            };
+                            })
+                        };
+                        if let Some(color) = underline_color {
                             let rect = response.rect;
                             ui.painter().line_segment(
                                 [
                                     egui::pos2(rect.left() + 5.0, rect.bottom() - 2.0),
                                     egui::pos2(rect.right() - 5.0, rect.bottom() - 2.0),
                                 ],
-                                egui::Stroke::new(2.0, underline_color),
+                                egui::Stroke::new(2.0, color),
                             );
                         }
 
@@ -871,8 +1093,19 @@ impl eframe::App for LaunchBarApp {
                 ui.add_space(theme.spacing_xs);
                 if let Some(idx) = hovered_index {
                     if let Some(cmd) = self.commands.get(idx) {
+                        let detail =
+                            cmd.cmd
+                                .as_deref()
+                                .or(cmd.run.as_deref().map(|s| {
+                                    if s.len() > 30 {
+                                        "[script]"
+                                    } else {
+                                        s
+                                    }
+                                }))
+                                .unwrap_or("[no command]");
                         ui.label(
-                            egui::RichText::new(format!("{}: {}", cmd.name, cmd.cmd))
+                            egui::RichText::new(format!("{}: {}", cmd.name, detail))
                                 .color(colors::STATUS_TEXT)
                                 .size(theme.font_size_xs),
                         );
