@@ -9,6 +9,11 @@ keywords = ["cli", "launcher", "egui", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
 
+[features]
+default = ["rhai-script", "lua-script"]
+rhai-script = ["rhai"]
+lua-script = ["mlua"]
+
 [dependencies]
 egui-cha = "0.4.0"
 egui-cha-ds = "0.4.0"
@@ -19,4 +24,5 @@ dirs = "6.0"
 shellexpand = "3.1"
 arboard = "3.4"
 notify = "8.0"
-rhai = "1.24.0"
+rhai = { version = "1.24", optional = true }
+mlua = { version = "0.10", features = ["lua54"], optional = true }

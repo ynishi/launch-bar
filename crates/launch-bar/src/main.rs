@@ -23,8 +23,10 @@ use eframe::egui;
 use egui_cha_ds::icons;
 use egui_cha_ds::Theme;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use rhai::{Engine, Scope};
 use serde::{Deserialize, Serialize};
+
+mod script;
+use script::{resolve_script_type, run_script, ScriptConfig, ScriptType};
 
 // ============================================================================
 // Config
@@ -50,6 +52,8 @@ struct Preset {
     #[serde(default)]
     base_color: Option<String>,
     #[serde(default)]
+    default_script: Option<ScriptType>,
+    #[serde(default)]
     commands: Vec<CommandConfig>,
 }
 
@@ -60,6 +64,8 @@ struct CommandConfig {
     cmd: Option<String>,
     #[serde(default)]
     run: Option<String>,
+    #[serde(default)]
+    script_type: Option<ScriptType>,
     #[serde(default)]
     icon: Option<String>,
     #[serde(default)]
@@ -80,6 +86,8 @@ struct WindowSettings {
     title_bar: String,
     #[serde(default = "default_auto")]
     accent_line: String,
+    #[serde(default)]
+    default_script: Option<ScriptType>,
 }
 
 fn default_max_icons() -> usize {
@@ -107,6 +115,7 @@ impl Default for WindowSettings {
             border: default_border(),
             title_bar: default_title_bar(),
             accent_line: default_auto(),
+            default_script: None,
         }
     }
 }
@@ -309,131 +318,6 @@ fn open_file(path: &PathBuf) {
 }
 
 // ============================================================================
-// Rhai Scripting
-// ============================================================================
-
-fn create_rhai_engine(cwd: Arc<PathBuf>) -> Engine {
-    let mut engine = Engine::new();
-
-    // clipboard() -> String (returns "[ERROR:clipboard]" on failure for visibility)
-    engine.register_fn("clipboard", || -> String {
-        Clipboard::new()
-            .and_then(|mut cb| cb.get_text())
-            .unwrap_or_else(|_| "[ERROR:clipboard]".to_string())
-    });
-
-    // clipboard_set(text) -> bool
-    engine.register_fn("clipboard_set", |text: String| -> bool {
-        Clipboard::new()
-            .and_then(|mut cb| cb.set_text(text))
-            .is_ok()
-    });
-
-    // shell(cmd) -> String
-    let cwd_for_shell = Arc::clone(&cwd);
-    engine.register_fn("shell", move |cmd: String| -> String {
-        let output = Command::new("sh")
-            .args(["-c", &cmd])
-            .current_dir(cwd_for_shell.as_ref())
-            .output();
-        match output {
-            Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
-            Err(e) => format!("[ERROR:shell] {}", e),
-        }
-    });
-
-    // shell_spawn(cmd) -> bool
-    let cwd_for_spawn = Arc::clone(&cwd);
-    engine.register_fn("shell_spawn", move |cmd: String| -> bool {
-        Command::new("sh")
-            .args(["-c", &cmd])
-            .current_dir(cwd_for_spawn.as_ref())
-            .spawn()
-            .is_ok()
-    });
-
-    // claude(prompt) -> String
-    let cwd_for_claude = Arc::clone(&cwd);
-    engine.register_fn("claude", move |prompt: String| -> String {
-        let output = Command::new("claude")
-            .args(["-p", &prompt])
-            .current_dir(cwd_for_claude.as_ref())
-            .output();
-        match output {
-            Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
-            Err(e) => format!("[ERROR:claude] {}", e),
-        }
-    });
-
-    // notify(message) - display alert dialog
-    #[cfg(target_os = "macos")]
-    engine.register_fn("notify", |msg: String| {
-        let escaped = msg
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", " ")
-            .replace("\r", "");
-        let script = format!(r#"display alert "Launch Bar" message "{}""#, escaped);
-        let _ = Command::new("osascript").args(["-e", &script]).spawn();
-    });
-
-    #[cfg(not(target_os = "macos"))]
-    engine.register_fn("notify", |msg: String| {
-        eprintln!("[notify] {}", msg);
-    });
-
-    // open(path) - open file/URL with default app
-    engine.register_fn("open", |path: String| {
-        #[cfg(target_os = "macos")]
-        let _ = Command::new("open").arg(&path).spawn();
-        #[cfg(target_os = "linux")]
-        let _ = Command::new("xdg-open").arg(&path).spawn();
-        #[cfg(target_os = "windows")]
-        let _ = Command::new("cmd").args(["/C", "start", &path]).spawn();
-    });
-
-    // env(name) -> String
-    engine.register_fn("env", |name: String| -> String {
-        std::env::var(&name).unwrap_or_default()
-    });
-
-    // read_file(path) -> String (returns "[ERROR:read_file] ..." on failure)
-    let cwd_for_read = Arc::clone(&cwd);
-    engine.register_fn("read_file", move |path: String| -> String {
-        let full_path = if path.starts_with('/') {
-            PathBuf::from(&path)
-        } else {
-            cwd_for_read.join(&path)
-        };
-        std::fs::read_to_string(&full_path)
-            .unwrap_or_else(|e| format!("[ERROR:read_file] {}: {}", path, e))
-    });
-
-    // write_file(path, content) -> bool
-    engine.register_fn("write_file", move |path: String, content: String| -> bool {
-        let full_path = if path.starts_with('/') {
-            PathBuf::from(path)
-        } else {
-            cwd.join(path)
-        };
-        std::fs::write(full_path, content).is_ok()
-    });
-
-    engine
-}
-
-/// Execute a Rhai script and return (success, message)
-fn run_rhai_script(script: &str, cwd: Arc<PathBuf>) -> (bool, String) {
-    let engine = create_rhai_engine(cwd);
-    let mut scope = Scope::new();
-
-    match engine.run_with_scope(&mut scope, script) {
-        Ok(_) => (true, "Script completed".to_string()),
-        Err(e) => (false, format!("Script error: {}", e)),
-    }
-}
-
-// ============================================================================
 // UI Helpers
 // ============================================================================
 
@@ -565,8 +449,8 @@ fn available_icons() -> Vec<&'static str> {
 // App
 // ============================================================================
 
-/// Result from async script execution
-struct ScriptResult {
+/// Result from async script execution (internal)
+struct AsyncScriptResult {
     index: usize,
     success: bool,
     message: String,
@@ -587,12 +471,13 @@ struct LaunchBarApp {
     state: AppState,
     preset_name: Option<String>,
     config_path: PathBuf,
+    script_config: ScriptConfig,
     // Process tracking
     running_processes: HashMap<usize, std::process::Child>,
     process_results: HashMap<usize, ProcessResult>,
     running_scripts: std::collections::HashSet<usize>,
-    script_rx: Receiver<ScriptResult>,
-    script_tx: Sender<ScriptResult>,
+    script_rx: Receiver<AsyncScriptResult>,
+    script_tx: Sender<AsyncScriptResult>,
     // File watcher for highlight
     file_changed: Arc<AtomicBool>,
     highlight_until: Option<Instant>,
@@ -607,6 +492,7 @@ enum ProcessResult {
 }
 
 impl LaunchBarApp {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         cc: &eframe::CreationContext<'_>,
         commands: Vec<CommandConfig>,
@@ -615,6 +501,7 @@ impl LaunchBarApp {
         working_dir: PathBuf,
         preset_name: Option<String>,
         config_path: PathBuf,
+        script_config: ScriptConfig,
     ) -> Self {
         egui_cha_ds::setup_fonts(&cc.egui_ctx);
         let working_dir_str = working_dir.to_string_lossy().to_string();
@@ -667,6 +554,7 @@ impl LaunchBarApp {
             state,
             preset_name,
             config_path,
+            script_config,
             running_processes: HashMap::new(),
             process_results: HashMap::new(),
             running_scripts: std::collections::HashSet::new(),
@@ -686,7 +574,7 @@ impl LaunchBarApp {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| self.working_dir.clone());
 
-            // Rhai script execution (async)
+            // Script execution (async)
             if let Some(ref script) = cmd_config.run {
                 // Warn if both cmd and run are set
                 if cmd_config.cmd.is_some() {
@@ -706,21 +594,23 @@ impl LaunchBarApp {
                 self.is_error = false;
 
                 let script = script.clone();
+                let script_type =
+                    resolve_script_type(cmd_config.script_type, &script, &self.script_config);
                 let cwd = Arc::new(cwd);
                 let tx = self.script_tx.clone();
 
                 std::thread::spawn(move || {
                     // Catch panics to ensure tx.send is always called
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_rhai_script(&script, cwd)
+                        run_script(&script, script_type, cwd)
                     }));
 
                     let (success, message) = match result {
-                        Ok((s, m)) => (s, m),
+                        Ok(r) => (r.success, r.message),
                         Err(_) => (false, "Script panicked".to_string()),
                     };
 
-                    let _ = tx.send(ScriptResult {
+                    let _ = tx.send(AsyncScriptResult {
                         index,
                         success,
                         message,
@@ -1229,25 +1119,37 @@ fn main() -> eframe::Result<()> {
     } else {
         detect_preset(&working_dir, &config.presets)
     };
-    let (commands, base_color, preset_name) = if let Some(preset) = detected_preset {
-        let color = preset
-            .base_color
-            .as_ref()
-            .and_then(|c| parse_hex_color(c))
-            .unwrap_or(egui::Color32::from_rgb(26, 26, 30));
-        (preset.commands.clone(), color, Some(preset.name.clone()))
-    } else if !config.commands.is_empty() {
-        let color = config
-            .window
-            .background_color
-            .as_ref()
-            .and_then(|c| parse_hex_color(c))
-            .unwrap_or(egui::Color32::from_rgb(26, 26, 30));
-        (config.commands.clone(), color, None)
-    } else {
-        // No preset matched, no fallback commands
-        eprintln!("No preset matched and no fallback commands defined");
-        (vec![], egui::Color32::from_rgb(26, 26, 30), None)
+    let (commands, base_color, preset_name, preset_default_script) =
+        if let Some(preset) = detected_preset {
+            let color = preset
+                .base_color
+                .as_ref()
+                .and_then(|c| parse_hex_color(c))
+                .unwrap_or(egui::Color32::from_rgb(26, 26, 30));
+            (
+                preset.commands.clone(),
+                color,
+                Some(preset.name.clone()),
+                preset.default_script,
+            )
+        } else if !config.commands.is_empty() {
+            let color = config
+                .window
+                .background_color
+                .as_ref()
+                .and_then(|c| parse_hex_color(c))
+                .unwrap_or(egui::Color32::from_rgb(26, 26, 30));
+            (config.commands.clone(), color, None, None)
+        } else {
+            // No preset matched, no fallback commands
+            eprintln!("No preset matched and no fallback commands defined");
+            (vec![], egui::Color32::from_rgb(26, 26, 30), None, None)
+        };
+
+    // Build script config
+    let script_config = ScriptConfig {
+        global_default: config.window.default_script,
+        preset_default: preset_default_script,
     };
 
     // Limit commands to max_icons
@@ -1279,6 +1181,7 @@ fn main() -> eframe::Result<()> {
                 working_dir,
                 preset_name,
                 config_path,
+                script_config,
             )))
         }),
     )
@@ -1297,6 +1200,21 @@ opacity = 0.8              # Background opacity (0.0 - 1.0)
 border = "auto"            # "auto", "show", "hide"
 title_bar = "auto"         # "auto" (hover), "show", "hide"
 accent_line = "auto"       # "auto" (highlight on change/hover), "show", "hide"
+# default_script = "rhai"  # Global default: "rhai" or "lua"
+
+# ============================================================================
+# Scripting
+# ============================================================================
+# Scripts can be written in Rhai or Lua. Script type is resolved in this order:
+# 1. Explicit script_type on command
+# 2. File extension for @path references (.rhai or .lua)
+# 3. Preset's default_script
+# 4. Window's default_script (global)
+# 5. Fallback: rhai
+#
+# Available functions: clipboard(), clipboard_set(text), shell(cmd),
+#   shell_spawn(cmd), claude(prompt), notify(msg), open(path),
+#   env(name), read_file(path), write_file(path, content)
 
 # ============================================================================
 # Presets - Auto-detected by file or path pattern
@@ -1306,6 +1224,7 @@ accent_line = "auto"       # "auto" (highlight on change/hover), "show", "hide"
 name = "RustDev"
 detect_file = "Cargo.toml"
 base_color = "#FF7043"     # Deep Orange
+# default_script = "rhai"  # Preset default script type
 commands = [
     {{ name = "Run", cmd = "cargo run", icon = "play" }},
     {{ name = "Test", cmd = "cargo test", icon = "check" }},
@@ -1330,11 +1249,14 @@ commands = [
 name = "Python"
 detect_file = "pyproject.toml"
 base_color = "#42A5F5"     # Blue
+default_script = "lua"     # Use Lua for this preset
 commands = [
     {{ name = "Run", cmd = "python main.py", icon = "play" }},
     {{ name = "Test", cmd = "pytest", icon = "check" }},
     {{ name = "Lint", cmd = "ruff check .", icon = "eye" }},
     {{ name = "Fmt", cmd = "ruff format .", icon = "edit" }},
+    # Script example (uses preset's default_script = "lua")
+    {{ name = "Info", run = "notify('Python project')", icon = "info" }},
 ]
 
 # ============================================================================
@@ -1350,6 +1272,12 @@ icon = "terminal"
 name = "Finder"
 cmd = "open ."
 icon = "folder"
+
+# Script with explicit type
+# {{ name = "Greet", run = "notify('Hello!')", script_type = "rhai", icon = "info" }}
+
+# Script from file (type detected by extension)
+# {{ name = "Custom", run = "@scripts/custom.lua", icon = "code" }}
 
 # Available icons: {icons}
 "##,
