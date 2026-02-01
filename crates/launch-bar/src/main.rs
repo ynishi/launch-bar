@@ -57,6 +57,13 @@ struct Preset {
     commands: Vec<CommandConfig>,
 }
 
+impl Preset {
+    /// Returns true if this preset has no detection rules (i.e., a global/fallback preset)
+    fn is_global(&self) -> bool {
+        self.detect_file.is_none() && self.cwd_pattern.is_none()
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct CommandConfig {
     name: String,
@@ -194,12 +201,17 @@ fn open_file_with_default_app(path: &std::path::Path) -> std::io::Result<()> {
 // Preset Detection
 // ============================================================================
 
+#[allow(dead_code)]
 fn detect_preset<'a>(working_dir: &std::path::Path, presets: &'a [Preset]) -> Option<&'a Preset> {
-    for preset in presets {
+    detect_preset_idx(working_dir, presets).and_then(|i| presets.get(i))
+}
+
+fn detect_preset_idx(working_dir: &std::path::Path, presets: &[Preset]) -> Option<usize> {
+    for (i, preset) in presets.iter().enumerate() {
         // Check detect_file
         if let Some(ref file) = preset.detect_file {
             if working_dir.join(file).exists() {
-                return Some(preset);
+                return Some(i);
             }
         }
 
@@ -211,10 +223,10 @@ fn detect_preset<'a>(working_dir: &std::path::Path, presets: &'a [Preset]) -> Op
             if expanded.ends_with('*') {
                 let prefix = &expanded[..expanded.len() - 1];
                 if cwd_str.starts_with(prefix) {
-                    return Some(preset);
+                    return Some(i);
                 }
             } else if cwd_str == expanded {
-                return Some(preset);
+                return Some(i);
             }
         }
     }
@@ -505,6 +517,12 @@ struct LaunchBarApp {
     highlight_until: Option<Instant>,
     #[allow(dead_code)]
     watcher: Option<RecommendedWatcher>,
+    // Preset switching
+    all_presets: Vec<Preset>,
+    preset_order: Vec<usize>, // Indices into all_presets, ordered for switching
+    current_preset_idx: usize, // Index into preset_order
+    max_icons: usize,
+    global_default_script: Option<ScriptType>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -524,6 +542,8 @@ impl LaunchBarApp {
         preset_name: Option<String>,
         config_path: PathBuf,
         script_config: ScriptConfig,
+        all_presets: Vec<Preset>,
+        detected_preset_idx: Option<usize>,
     ) -> Self {
         egui_cha_ds::setup_fonts(&cc.egui_ctx);
         let working_dir_str = working_dir.to_string_lossy().to_string();
@@ -561,6 +581,13 @@ impl LaunchBarApp {
 
         let (script_tx, script_rx) = mpsc::channel();
 
+        // Build preset switching order: detected -> global -> others
+        let preset_order = Self::build_preset_order(&all_presets, detected_preset_idx);
+        let current_preset_idx = 0; // Start with first in order (detected or first available)
+
+        let max_icons = window.max_icons;
+        let global_default_script = window.default_script;
+
         Self {
             commands,
             working_dir,
@@ -585,6 +612,81 @@ impl LaunchBarApp {
             file_changed,
             highlight_until: None,
             watcher,
+            all_presets,
+            preset_order,
+            current_preset_idx,
+            max_icons,
+            global_default_script,
+        }
+    }
+
+    /// Build preset order for switching: detected preset first, then globals, then others
+    fn build_preset_order(presets: &[Preset], detected_idx: Option<usize>) -> Vec<usize> {
+        let mut order = Vec::new();
+
+        // 1. Detected preset first (if any)
+        if let Some(idx) = detected_idx {
+            order.push(idx);
+        }
+
+        // 2. Global presets (no detect_file, no cwd_pattern)
+        for (i, preset) in presets.iter().enumerate() {
+            if preset.is_global() && Some(i) != detected_idx {
+                order.push(i);
+            }
+        }
+
+        // 3. Other presets (has detection rules but wasn't detected)
+        for (i, preset) in presets.iter().enumerate() {
+            if !preset.is_global() && Some(i) != detected_idx {
+                order.push(i);
+            }
+        }
+
+        order
+    }
+
+    /// Switch to next preset in the cycle order
+    fn switch_to_next_preset(&mut self) {
+        if self.preset_order.is_empty() {
+            return;
+        }
+
+        // Move to next preset in order (wrap around)
+        self.current_preset_idx = (self.current_preset_idx + 1) % self.preset_order.len();
+        let preset_idx = self.preset_order[self.current_preset_idx];
+
+        if let Some(preset) = self.all_presets.get(preset_idx) {
+            // Update commands
+            self.commands = preset
+                .commands
+                .iter()
+                .take(self.max_icons)
+                .cloned()
+                .collect();
+
+            // Update base color
+            self.base_color = preset
+                .base_color
+                .as_ref()
+                .and_then(|c| parse_hex_color(c))
+                .unwrap_or(colors::BASE_BG);
+
+            // Update preset name
+            self.preset_name = Some(preset.name.clone());
+
+            // Update script config
+            self.script_config = ScriptConfig {
+                global_default: self.global_default_script,
+                preset_default: preset.default_script,
+            };
+
+            // Clear running state
+            self.running_processes.clear();
+            self.process_results.clear();
+            self.running_scripts.clear();
+            self.last_status = Some(format!("Switched to: {}", preset.name));
+            self.is_error = false;
         }
     }
 
@@ -836,6 +938,8 @@ impl eframe::App for LaunchBarApp {
             }),
         };
 
+        let mut switch_preset = false;
+
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
@@ -928,9 +1032,31 @@ impl eframe::App for LaunchBarApp {
                             if title_bar_button(ui, icons::GEAR, "Open config").clicked() {
                                 open_file(&self.config_path);
                             }
+
+                            // Preset switch button (only show if multiple presets available)
+                            if self.preset_order.len() > 1 {
+                                let next_idx =
+                                    (self.current_preset_idx + 1) % self.preset_order.len();
+                                let next_preset_idx = self.preset_order[next_idx];
+                                let tooltip = self
+                                    .all_presets
+                                    .get(next_preset_idx)
+                                    .map(|p| format!("Switch to: {}", p.name))
+                                    .unwrap_or_else(|| "Switch preset".to_string());
+
+                                if title_bar_button(ui, icons::ARROWS_CLOCKWISE, &tooltip).clicked()
+                                {
+                                    switch_preset = true;
+                                }
+                            }
                         });
                     }
                 });
+
+                // Handle preset switch outside of UI closure
+                if switch_preset {
+                    self.switch_to_next_preset();
+                }
 
                 // Command buttons
                 let mut clicked_index = None;
@@ -1179,43 +1305,74 @@ fn main() -> eframe::Result<()> {
         }
     }
 
-    let (config, config_path): (Config, PathBuf) = if local_config_path.exists() {
-        let content =
-            std::fs::read_to_string(&local_config_path).expect("Failed to read launch-bar.toml");
-        (
-            toml::from_str(&content).expect("Failed to parse launch-bar.toml"),
-            local_config_path,
-        )
-    } else if global_config_path.exists() {
-        let content =
-            std::fs::read_to_string(&global_config_path).expect("Failed to read global config");
-        (
-            toml::from_str(&content).expect("Failed to parse global config"),
-            global_config_path.clone(),
-        )
-    } else {
-        // Create example config
-        let example = generate_example_config();
-        if let Some(parent) = global_config_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+    // Load and merge configs: local presets + global presets
+    // Priority: local window settings > global window settings
+    // Presets: local presets first, then global presets (excluding duplicates by name)
+    let (config, config_path): (Config, PathBuf) = {
+        let global_config: Option<Config> = if global_config_path.exists() {
+            std::fs::read_to_string(&global_config_path)
+                .ok()
+                .and_then(|content| toml::from_str(&content).ok())
+        } else {
+            None
+        };
+
+        let local_config: Option<Config> = if local_config_path.exists() {
+            std::fs::read_to_string(&local_config_path)
+                .ok()
+                .and_then(|content| toml::from_str(&content).ok())
+        } else {
+            None
+        };
+
+        match (local_config, global_config) {
+            (Some(mut local), Some(global)) => {
+                // Merge: local presets + global presets (skip duplicates)
+                let local_names: std::collections::HashSet<_> = local
+                    .presets
+                    .iter()
+                    .map(|p| p.name.to_lowercase())
+                    .collect();
+                for preset in global.presets {
+                    if !local_names.contains(&preset.name.to_lowercase()) {
+                        local.presets.push(preset);
+                    }
+                }
+                // Merge fallback commands if local has none
+                if local.commands.is_empty() {
+                    local.commands = global.commands;
+                }
+                (local, local_config_path)
+            }
+            (Some(local), None) => (local, local_config_path),
+            (None, Some(global)) => (global, global_config_path.clone()),
+            (None, None) => {
+                // Create example config
+                let example = generate_example_config();
+                if let Some(parent) = global_config_path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                std::fs::write(&global_config_path, &example).ok();
+                eprintln!(
+                    "Created example config at: {}",
+                    global_config_path.display()
+                );
+                (toml::from_str(&example).unwrap(), global_config_path)
+            }
         }
-        std::fs::write(&global_config_path, &example).ok();
-        eprintln!(
-            "Created example config at: {}",
-            global_config_path.display()
-        );
-        (toml::from_str(&example).unwrap(), global_config_path)
     };
 
-    // Find preset: explicit > auto-detect
-    let detected_preset = if let Some(ref name) = explicit_preset {
+    // Find preset: explicit > auto-detect (with index for switching)
+    let detected_preset_idx: Option<usize> = if let Some(ref name) = explicit_preset {
         config
             .presets
             .iter()
-            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .position(|p| p.name.eq_ignore_ascii_case(name))
     } else {
-        detect_preset(&working_dir, &config.presets)
+        detect_preset_idx(&working_dir, &config.presets)
     };
+    let detected_preset = detected_preset_idx.and_then(|i| config.presets.get(i));
+
     let (commands, base_color, preset_name, preset_default_script) =
         if let Some(preset) = detected_preset {
             let color = preset
@@ -1242,6 +1399,9 @@ fn main() -> eframe::Result<()> {
             eprintln!("No preset matched and no fallback commands defined");
             (vec![], egui::Color32::from_rgb(26, 26, 30), None, None)
         };
+
+    // Clone presets for the app (needed for switching)
+    let all_presets = config.presets.clone();
 
     // Build script config
     let script_config = ScriptConfig {
@@ -1279,6 +1439,8 @@ fn main() -> eframe::Result<()> {
                 preset_name,
                 config_path,
                 script_config,
+                all_presets,
+                detected_preset_idx,
             )))
         }),
     )
