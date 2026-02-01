@@ -169,6 +169,28 @@ impl AppState {
 }
 
 // ============================================================================
+// Config File Operations
+// ============================================================================
+
+fn open_file_with_default_app(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(path).status()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(path).status()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy()])
+            .status()?;
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Preset Detection
 // ============================================================================
 
@@ -1034,6 +1056,76 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut explicit_preset: Option<String> = None;
 
+    // Handle 'config' subcommand
+    if args.len() >= 2 && args[1] == "config" {
+        let sub_args: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
+
+        match sub_args.first().copied() {
+            Some("open") => {
+                let target_path = if sub_args.contains(&"--global") || sub_args.contains(&"-g") {
+                    if !global_config_path.exists() {
+                        eprintln!("Global config not found. Run 'launch-bar --init-global' first.");
+                        std::process::exit(1);
+                    }
+                    global_config_path.clone()
+                } else if sub_args.contains(&"--local") || sub_args.contains(&"-l") {
+                    if !local_config_path.exists() {
+                        eprintln!("Local config not found. Run 'launch-bar --init' first.");
+                        std::process::exit(1);
+                    }
+                    local_config_path.clone()
+                } else {
+                    // Default: local > global
+                    if local_config_path.exists() {
+                        local_config_path.clone()
+                    } else if global_config_path.exists() {
+                        global_config_path.clone()
+                    } else {
+                        eprintln!("No config file found. Run 'launch-bar --init' or '--init-global' first.");
+                        std::process::exit(1);
+                    }
+                };
+                println!("Opening: {}", target_path.display());
+                if let Err(e) = open_file_with_default_app(&target_path) {
+                    eprintln!("Failed to open config: {}", e);
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            }
+            Some("path") => {
+                if sub_args.contains(&"--global") || sub_args.contains(&"-g") {
+                    println!("{}", global_config_path.display());
+                } else if sub_args.contains(&"--local") || sub_args.contains(&"-l") {
+                    println!("{}", local_config_path.display());
+                } else {
+                    println!("Global: {}", global_config_path.display());
+                    println!("Local:  {}", local_config_path.display());
+                    if local_config_path.exists() {
+                        println!("Active: {} (local)", local_config_path.display());
+                    } else if global_config_path.exists() {
+                        println!("Active: {} (global)", global_config_path.display());
+                    } else {
+                        println!("Active: (none)");
+                    }
+                }
+                std::process::exit(0);
+            }
+            Some(cmd) => {
+                eprintln!("Unknown config subcommand: {}", cmd);
+                eprintln!("Available: open, path");
+                std::process::exit(1);
+            }
+            None => {
+                println!("Usage: launch-bar config <COMMAND>");
+                println!();
+                println!("Commands:");
+                println!("  open [--global|-g] [--local|-l]  Open config in default editor");
+                println!("  path [--global|-g] [--local|-l]  Show config file path(s)");
+                std::process::exit(0);
+            }
+        }
+    }
+
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1069,13 +1161,18 @@ fn main() -> eframe::Result<()> {
                 std::process::exit(0);
             }
             "--help" | "-h" => {
-                println!("Usage: launch-bar [OPTIONS]");
+                println!("Usage: launch-bar [OPTIONS] [COMMAND]");
+                println!();
+                println!("Commands:");
+                println!("  config               Manage configuration files");
                 println!();
                 println!("Options:");
                 println!("  -p, --preset <NAME>  Use specific preset");
                 println!("      --init           Create local config (./launch-bar.toml)");
                 println!("      --init-global    Create/reset global config");
                 println!("  -h, --help           Show this help");
+                println!();
+                println!("Run 'launch-bar config' for config subcommand help");
                 std::process::exit(0);
             }
             _ => i += 1,
