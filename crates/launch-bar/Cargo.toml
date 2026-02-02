@@ -1,6 +1,6 @@
 [package]
 name = "launch-bar"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Context-aware command launcher with icon buttons"
 license = "MIT"
