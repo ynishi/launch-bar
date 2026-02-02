@@ -4,6 +4,9 @@ use serde::Deserialize;
 
 use crate::script::ScriptType;
 
+/// Reserved name for top-level commands converted to preset
+pub const GLOBAL_PRESET_NAME: &str = "[Global]";
+
 /// Main configuration structure
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -13,6 +16,25 @@ pub struct Config {
     pub presets: Vec<Preset>,
     #[serde(default)]
     pub commands: Vec<CommandConfig>,
+}
+
+impl Config {
+    /// Convert top-level commands to a [Global] preset
+    ///
+    /// Returns None if no commands are defined.
+    pub fn commands_as_preset(&self) -> Option<Preset> {
+        if self.commands.is_empty() {
+            return None;
+        }
+        Some(Preset {
+            name: GLOBAL_PRESET_NAME.to_string(),
+            detect_file: None,
+            cwd_pattern: None,
+            base_color: self.window.background_color.clone(),
+            default_script: self.window.default_script,
+            commands: self.commands.clone(),
+        })
+    }
 }
 
 /// Preset configuration for project-specific commands
